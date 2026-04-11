@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: leadscout-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: leadscout
+      POSTGRES_PASSWORD: leadscout_secret
+      POSTGRES_DB: leadscout
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
