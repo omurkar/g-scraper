@@ -1,18 +1,58 @@
-"""Google Maps scraper — robust version with full stealth & interaction simulation."""
+"""Google Maps scraper — sync-thread version for Windows/Python 3.13 compatibility."""
 
 import asyncio
 import logging
 import random
 import re
+import time
 from typing import List, Optional, Callable
 from urllib.parse import quote_plus
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-
-from utils.stealth import apply_stealth_scripts, get_stealth_context_options, human_delay, micro_delay
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 logger = logging.getLogger(__name__)
 
+
+# ── Stealth helpers (sync versions) ──────────────────────────────────────────
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
+
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1536, "height": 864},
+]
+
+STEALTH_JS = """
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters)
+    );
+"""
+
+
+def _human_sleep(min_s: float = 1.5, max_s: float = 3.5):
+    time.sleep(random.uniform(min_s, max_s))
+
+
+def _micro_sleep(min_ms: int = 200, max_ms: int = 800):
+    time.sleep(random.randint(min_ms, max_ms) / 1000)
+
+
+# ── Main async entry point ──────────────────────────────────────────────────
 
 async def scrape_google_maps(
     keyword: str,
@@ -22,12 +62,27 @@ async def scrape_google_maps(
 ) -> List[dict]:
     """
     Scrape Google Maps for businesses matching keyword + location.
-    Strategy: Navigate to Maps, search, scroll feed, collect place links, then extract details.
+    Runs Playwright's SYNC API in a separate thread to avoid
+    Windows/Python 3.13 event-loop incompatibility.
     """
+    return await asyncio.to_thread(
+        _sync_scrape, keyword, location, max_results, on_progress
+    )
+
+
+# ── Sync scraper (runs inside a thread) ─────────────────────────────────────
+
+def _sync_scrape(
+    keyword: str,
+    location: str,
+    max_results: int,
+    on_progress: Optional[Callable],
+) -> List[dict]:
+    """Synchronous scraper — safe to call from asyncio.to_thread()."""
     results: List[dict] = []
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -42,133 +97,118 @@ async def scrape_google_maps(
             ],
         )
 
-        ctx_opts = await get_stealth_context_options()
-        context = await browser.new_context(**ctx_opts)
-        page = await context.new_page()
-        await apply_stealth_scripts(page)
+        vp = random.choice(VIEWPORTS)
+        context = browser.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            viewport=vp,
+            locale="en-US",
+            timezone_id="America/New_York",
+            ignore_https_errors=True,
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            },
+        )
+        page = context.new_page()
+        page.add_init_script(STEALTH_JS)
 
-        # Block irrelevant resources to speed things up
-        await page.route(
+        # Block heavy resources
+        page.route(
             "**/*.{png,jpg,jpeg,gif,mp4,mp3,woff,woff2,ttf,ico}",
             lambda r: r.abort()
         )
 
         try:
-            # ── Step 1: Go to google.com/maps first (more natural) ──────────
-            logger.info("Opening Google Maps…")
-            await page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=20_000)
-            await human_delay(2.0, 3.5)
-
-            # Dismiss consent/cookie banners
-            await _dismiss_consent(page)
-
-            # ── Step 2: Type query into the search box ──────────────────────
+            # ── Step 1: Navigate to Google Maps ──────────────────────────
             query = f"{keyword} in {location}"
+            logger.info(f"Opening Google Maps…")
+            page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=20_000)
+            _human_sleep(2.0, 3.5)
+
+            # Dismiss consent
+            _dismiss_consent_sync(page)
+
+            # ── Step 2: Type the search query ────────────────────────────
             logger.info(f"Searching for: {query}")
 
-            search_selectors = [
-                'input#searchboxinput',
-                'input[name="q"]',
-                'input[placeholder*="Search"]',
-                'input[aria-label*="Search"]',
-            ]
-            search_input = None
-            for sel in search_selectors:
-                try:
-                    el = page.locator(sel).first
-                    if await el.is_visible(timeout=5000):
-                        search_input = el
-                        break
-                except Exception:
-                    continue
-
+            search_input = _find_search_input(page)
             if search_input is None:
-                logger.error("Search input not found — using direct URL approach")
-                return await _direct_url_scrape(page, keyword, location, max_results, on_progress)
+                logger.warning("Search input not found — using direct URL")
+                return _direct_url_scrape_sync(page, keyword, location, max_results, on_progress)
 
-            # Human-like typing
-            await search_input.click()
-            await micro_delay(300, 600)
-            await search_input.fill("")
-            await micro_delay(200, 400)
+            search_input.click()
+            _micro_sleep(300, 600)
+            search_input.fill("")
+            _micro_sleep(200, 400)
+
+            # Type character-by-character for stealth
             for char in query:
-                await page.keyboard.type(char, delay=random.randint(40, 120))
-            await micro_delay(400, 800)
-            await page.keyboard.press("Enter")
+                page.keyboard.type(char, delay=random.randint(40, 120))
+            _micro_sleep(400, 800)
+            page.keyboard.press("Enter")
 
-            # ── Step 3: Wait for results feed ───────────────────────────────
-            await human_delay(3.0, 5.0)
-
-            feed = await _wait_for_feed(page)
+            # ── Step 3: Wait for results feed ────────────────────────────
+            _human_sleep(3.0, 5.0)
+            feed = _wait_for_feed_sync(page)
             if not feed:
-                logger.warning("Feed not found after typing — falling back to direct URL")
-                return await _direct_url_scrape(page, keyword, location, max_results, on_progress)
+                logger.warning("Feed not found — falling back to direct URL")
+                return _direct_url_scrape_sync(page, keyword, location, max_results, on_progress)
 
-            # ── Step 4: Scroll to load more results ─────────────────────────
-            biz_links = await _scroll_and_collect_links(page, feed, max_results)
+            # ── Step 4: Scroll to load results ───────────────────────────
+            biz_links = _scroll_and_collect_sync(page, feed, max_results)
             logger.info(f"Collected {len(biz_links)} place links")
 
-            # ── Step 5: Extract details from each place page ─────────────────
+            # ── Step 5: Extract details from each place ──────────────────
             for i, link in enumerate(biz_links[:max_results]):
                 if len(results) >= max_results:
                     break
                 try:
-                    biz = await _extract_place_details(page, link)
+                    biz = _extract_place_sync(page, link)
                     if biz and biz.get("business_name"):
                         results.append(biz)
                         logger.info(f"  [{len(results)}/{max_results}] {biz['business_name']}")
                         if on_progress:
                             on_progress({"lead": biz, "count": len(results)})
-                    await micro_delay(600, 1400)
+                    _micro_sleep(600, 1400)
                 except Exception as e:
                     logger.warning(f"  Place {i} error: {e}")
 
         except Exception as e:
             logger.error(f"Scraper fatal: {e}", exc_info=True)
         finally:
-            await context.close()
-            await browser.close()
+            context.close()
+            browser.close()
 
     logger.info(f"Scraping done: {len(results)} leads")
     return results
 
 
-async def _direct_url_scrape(page, keyword, location, max_results, on_progress) -> List[dict]:
-    """Fallback: navigate directly to /maps/search/ URL."""
-    query = f"{keyword} in {location}"
-    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
-    results = []
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    await page.goto(url, wait_until="networkidle", timeout=25_000)
-    await human_delay(2.5, 4.0)
-    await _dismiss_consent(page)
-
-    feed = await _wait_for_feed(page)
-    if not feed:
-        logger.error("Feed not found in direct URL mode either")
-        return results
-
-    biz_links = await _scroll_and_collect_links(page, feed, max_results)
-    logger.info(f"Direct mode: {len(biz_links)} links")
-
-    for i, link in enumerate(biz_links[:max_results]):
-        if len(results) >= max_results:
-            break
+def _find_search_input(page):
+    """Locate the Google Maps search box."""
+    for sel in [
+        'input#searchboxinput',
+        'input[name="q"]',
+        'input[placeholder*="Search"]',
+        'input[aria-label*="Search"]',
+    ]:
         try:
-            biz = await _extract_place_details(page, link)
-            if biz and biz.get("business_name"):
-                results.append(biz)
-                if on_progress:
-                    on_progress({"lead": biz, "count": len(results)})
-            await micro_delay(600, 1400)
-        except Exception as e:
-            logger.warning(f"  Place {i} error: {e}")
-
-    return results
+            el = page.locator(sel).first
+            if el.is_visible(timeout=5000):
+                return el
+        except Exception:
+            continue
+    return None
 
 
-async def _dismiss_consent(page) -> None:
-    """Try to click through any consent/cookie banners."""
+def _dismiss_consent_sync(page):
+    """Click through consent/cookie banners."""
     for selector in [
         'button:has-text("Accept all")',
         'button:has-text("Accept")',
@@ -176,32 +216,31 @@ async def _dismiss_consent(page) -> None:
         'button:has-text("I agree")',
         'button[aria-label*="Accept"]',
         'form[action*="consent"] button',
-        '#L2AGLb',   # Google's "Accept all" button ID
+        '#L2AGLb',
     ]:
         try:
             btn = page.locator(selector).first
-            if await btn.is_visible(timeout=2500):
-                await btn.click()
+            if btn.is_visible(timeout=2500):
+                btn.click()
                 logger.info(f"Dismissed consent via: {selector}")
-                await micro_delay(800, 1500)
+                _micro_sleep(800, 1500)
                 return
         except Exception:
             pass
 
 
-async def _wait_for_feed(page, timeout: int = 15_000):
-    """Wait for the Google Maps results feed to appear."""
-    selectors = [
+def _wait_for_feed_sync(page, timeout: int = 15_000):
+    """Wait for the Google Maps results feed."""
+    for sel in [
         'div[role="feed"]',
         'div.m6QErb[role="region"]',
         'div.m6QErb',
         '[aria-label*="Results for"]',
         '[aria-label*="results"]',
-    ]
-    for sel in selectors:
+    ]:
         try:
             loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=timeout)
+            loc.wait_for(state="visible", timeout=timeout)
             logger.info(f"Feed found: {sel}")
             return loc
         except PlaywrightTimeout:
@@ -209,22 +248,21 @@ async def _wait_for_feed(page, timeout: int = 15_000):
     return None
 
 
-async def _scroll_and_collect_links(page, feed, max_results: int) -> List[str]:
-    """Scroll the results feed and collect all /maps/place/ links."""
-    target_count = max_results + 10
+def _scroll_and_collect_sync(page, feed, max_results: int) -> List[str]:
+    """Scroll the feed and collect /maps/place/ links."""
+    target = max_results + 10
     scroll_attempts = 0
     max_scrolls = 20
     last_count = 0
     stale_rounds = 0
 
     while scroll_attempts < max_scrolls:
-        # Collect current place links
-        links = await page.evaluate("""() => {
+        links = page.evaluate("""() => {
             const anchors = document.querySelectorAll('a[href*="/maps/place/"]');
             const seen = new Set();
             const result = [];
             for (const a of anchors) {
-                const h = a.href.split('?')[0];  // normalize URL
+                const h = a.href.split('?')[0];
                 if (!seen.has(h)) { seen.add(h); result.push(a.href); }
             }
             return result;
@@ -233,31 +271,26 @@ async def _scroll_and_collect_links(page, feed, max_results: int) -> List[str]:
         current_count = len(links)
         logger.info(f"  Scroll {scroll_attempts}: {current_count} links")
 
-        if current_count >= target_count:
+        if current_count >= target:
             break
 
-        # Check if we've stalled
         if current_count == last_count:
             stale_rounds += 1
             if stale_rounds >= 3:
-                logger.info("No new links after 3 scroll rounds — stopping")
+                logger.info("No new links after 3 scrolls — stopping")
                 break
         else:
             stale_rounds = 0
         last_count = current_count
 
-        # Scroll the feed
-        await page.evaluate("""() => {
+        page.evaluate("""() => {
             const feed = document.querySelector('div[role="feed"]') ||
                          document.querySelector('.m6QErb');
-            if (feed) {
-                feed.scrollBy(0, 800);
-            }
+            if (feed) feed.scrollBy(0, 800);
         }""")
-        await human_delay(1.8, 3.2)
+        _human_sleep(1.8, 3.2)
 
-        # Check end-of-list marker
-        end_markers = await page.locator(
+        end_markers = page.locator(
             'span:has-text("reached the end"), '
             'span:has-text("You\'ve reached the end"), '
             'p:has-text("reached the end")'
@@ -269,7 +302,7 @@ async def _scroll_and_collect_links(page, feed, max_results: int) -> List[str]:
         scroll_attempts += 1
 
     # Final collection
-    final_links = await page.evaluate("""() => {
+    final = page.evaluate("""() => {
         const anchors = document.querySelectorAll('a[href*="/maps/place/"]');
         const seen = new Set();
         const result = [];
@@ -279,14 +312,14 @@ async def _scroll_and_collect_links(page, feed, max_results: int) -> List[str]:
         }
         return result;
     }""")
-    return final_links[:max_results + 5]
+    return final[:max_results + 5]
 
 
-async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
-    """Navigate to a Maps business page and extract all available details."""
+def _extract_place_sync(page, maps_url: str) -> Optional[dict]:
+    """Navigate to a Maps place page and extract details."""
     try:
-        await page.goto(maps_url, wait_until="domcontentloaded", timeout=15_000)
-        await human_delay(1.2, 2.5)
+        page.goto(maps_url, wait_until="domcontentloaded", timeout=15_000)
+        _human_sleep(1.2, 2.5)
     except PlaywrightTimeout:
         logger.warning(f"Timeout loading {maps_url}")
         return None
@@ -294,8 +327,7 @@ async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
         logger.warning(f"Error loading {maps_url}: {e}")
         return None
 
-    # Extract all data via a single JS evaluation for speed
-    data = await page.evaluate("""() => {
+    data = page.evaluate("""() => {
         const result = {};
 
         // Business name
@@ -334,7 +366,7 @@ async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
         const websiteLink = document.querySelector('a[data-item-id="authority"]');
         result.website = websiteLink ? websiteLink.href : '';
 
-        // Try alternate phone pattern
+        // Alternate phone
         if (!result.phone) {
             const allBtns = document.querySelectorAll('button[data-tooltip]');
             for (const b of allBtns) {
@@ -353,14 +385,14 @@ async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
         return None
 
     # Parse rating
-    rating: Optional[float] = None
+    rating = None
     try:
         rating = float(data.get("rating", "").replace(",", ".")) if data.get("rating") else None
     except (ValueError, AttributeError):
         pass
 
     # Parse review count
-    review_count: Optional[int] = None
+    review_count = None
     review_text = data.get("reviews", "")
     if review_text:
         m = re.search(r'[\d,]+', review_text)
@@ -372,7 +404,6 @@ async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
 
     name = data.get("name", "").strip()
     if not name:
-        # Fallback: extract from URL
         m2 = re.search(r'/maps/place/([^/@]+)', maps_url)
         if m2:
             name = m2.group(1).replace('+', ' ').replace('%20', ' ').replace('%26', '&')
@@ -387,3 +418,37 @@ async def _extract_place_details(page, maps_url: str) -> Optional[dict]:
         "website_url": data.get("website") or None,
         "google_maps_url": page.url,
     }
+
+
+def _direct_url_scrape_sync(page, keyword, location, max_results, on_progress) -> List[dict]:
+    """Fallback: navigate directly to /maps/search/ URL."""
+    query = f"{keyword} in {location}"
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+    results = []
+
+    page.goto(url, wait_until="networkidle", timeout=25_000)
+    _human_sleep(2.5, 4.0)
+    _dismiss_consent_sync(page)
+
+    feed = _wait_for_feed_sync(page)
+    if not feed:
+        logger.error("Feed not found in direct URL mode either")
+        return results
+
+    biz_links = _scroll_and_collect_sync(page, feed, max_results)
+    logger.info(f"Direct mode: {len(biz_links)} links")
+
+    for i, link in enumerate(biz_links[:max_results]):
+        if len(results) >= max_results:
+            break
+        try:
+            biz = _extract_place_sync(page, link)
+            if biz and biz.get("business_name"):
+                results.append(biz)
+                if on_progress:
+                    on_progress({"lead": biz, "count": len(results)})
+            _micro_sleep(600, 1400)
+        except Exception as e:
+            logger.warning(f"  Place {i} error: {e}")
+
+    return results

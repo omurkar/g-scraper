@@ -23,6 +23,25 @@ const QUALITY_ICONS = {
   cold: <Snowflake size={12} />,
 }
 
+const HEALTH_TAG_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
+  NO_SITE:    { label: 'NO SITE 🏆', color: '#f43f5e', bg: 'rgba(244,63,94,0.12)' },
+  FIX_NEEDED: { label: 'FIX NEEDED', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
+  GOOD_SITE:  { label: 'GOOD SITE', color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
+}
+
+function HealthBadge({ tag }: { tag?: string | null }) {
+  if (!tag) return <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>—</span>
+  const cfg = HEALTH_TAG_CONFIG[tag]
+  if (!cfg) return null
+  return (
+    <span style={{
+      display: 'inline-block', padding: '2px 7px', borderRadius: 5,
+      fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.04em',
+      background: cfg.bg, color: cfg.color, whiteSpace: 'nowrap',
+    }}>{cfg.label}</span>
+  )
+}
+
 function QualityBadge({ score }: { score?: string | null }) {
   if (!score) return <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>—</span>
   return (
@@ -176,11 +195,11 @@ export default function ResultsTable({ leads, loading }: Props) {
               {[
                 { label: 'Business', key: 'business_name' as SortKey },
                 { label: 'Rating', key: 'rating' as SortKey },
+                { label: 'Health' },
                 { label: 'Contact' },
                 { label: 'Emails' },
                 { label: 'Socials' },
                 { label: 'Quality', key: 'quality_score' as SortKey },
-                { label: 'Status', key: 'status' as SortKey },
                 { label: '' },
               ].map(({ label, key }) => (
                 <th
@@ -213,7 +232,6 @@ export default function ResultsTable({ leads, loading }: Props) {
               return [
                 <tr
                   key={lead.id}
-                  className="card-hover"
                   onClick={() => setExpandedId(expanded ? null : lead.id)}
                   style={{
                     borderBottom: '1px solid rgba(99,102,241,0.06)',
@@ -229,8 +247,10 @@ export default function ResultsTable({ leads, loading }: Props) {
                     <div style={{ fontWeight: 600, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {lead.business_name}
                     </div>
-                    {lead.category && (
-                      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: 2 }}>{lead.category}</div>
+                    {(lead.category || lead.locality) && (
+                      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: 2 }}>
+                        {lead.category}{lead.locality ? ` · ${lead.locality}` : ''}
+                      </div>
                     )}
                   </td>
 
@@ -243,6 +263,16 @@ export default function ResultsTable({ leads, loading }: Props) {
                         {lead.review_count && <span style={{ color: 'var(--text-muted)', fontSize: '0.72rem' }}>({lead.review_count})</span>}
                       </span>
                     ) : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                  </td>
+
+                  {/* Health tag */}
+                  <td style={{ padding: '12px 16px' }}>
+                    <HealthBadge tag={lead.website_tag} />
+                    {lead.health_issues && lead.health_issues.length > 0 && (
+                      <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginTop: 3, maxWidth: 120 }}>
+                        {lead.health_issues[0]}
+                      </div>
+                    )}
                   </td>
 
                   {/* Contact */}
@@ -345,25 +375,28 @@ export default function ResultsTable({ leads, loading }: Props) {
                   </td>
                 </tr>,
 
-                /* Expanded row — AI reasoning */
-                expanded && lead.verification?.ai_reasoning ? (
+                /* Expanded row — AI reasoning + health details */
+                expanded ? (
                   <tr key={`${lead.id}-expanded`} style={{ background: 'rgba(99,102,241,0.05)' }}>
-                    <td colSpan={8} style={{ padding: '10px 20px 14px' }}>
-                      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-                        <div style={{
-                          background: 'rgba(99,102,241,0.15)',
-                          borderRadius: 6,
-                          padding: '2px 8px',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
-                          color: 'var(--accent)',
-                          whiteSpace: 'nowrap',
-                        }}>
-                          🤖 AI Reasoning
-                        </div>
-                        <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                          {lead.verification.ai_reasoning}
-                        </p>
+                    <td colSpan={9} style={{ padding: '10px 20px 14px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {lead.health_issues && lead.health_issues.length > 0 && (
+                          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                            <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)' }}>🔍 Health Issues:</span>
+                            {lead.health_issues.map(issue => (
+                              <span key={issue} style={{ fontSize: '0.72rem', background: 'rgba(245,158,11,0.1)', color: '#f59e0b', borderRadius: 4, padding: '1px 7px' }}>{issue}</span>
+                            ))}
+                            {lead.load_time_ms && <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>Load: {lead.load_time_ms}ms</span>}
+                            {lead.ssl_ok !== undefined && <span style={{ fontSize: '0.72rem', color: lead.ssl_ok ? '#10b981' : '#f43f5e' }}>SSL: {lead.ssl_ok ? '✓' : '✗'}</span>}
+                            {lead.mobile_friendly !== undefined && <span style={{ fontSize: '0.72rem', color: lead.mobile_friendly ? '#10b981' : '#f43f5e' }}>Mobile: {lead.mobile_friendly ? '✓' : '✗'}</span>}
+                          </div>
+                        )}
+                        {lead.verification?.ai_reasoning && (
+                          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                            <div style={{ background: 'rgba(99,102,241,0.15)', borderRadius: 6, padding: '2px 8px', fontSize: '0.72rem', fontWeight: 700, color: 'var(--accent)', whiteSpace: 'nowrap' }}>🤖 AI</div>
+                            <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{lead.verification.ai_reasoning}</p>
+                          </div>
+                        )}
                       </div>
                     </td>
                   </tr>

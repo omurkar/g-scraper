@@ -1,20 +1,20 @@
-"""Website enrichment worker — visits each lead's site to extract emails & socials."""
+"""Website enrichment worker — sync-thread version for Windows/Python 3.13 compat."""
 
 import asyncio
 import logging
+import time
 from typing import List, Optional, Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-from utils.stealth import apply_stealth_scripts, get_stealth_context_options, human_delay
 from utils.parsers import extract_emails, extract_social_links, normalize_url
 
 logger = logging.getLogger(__name__)
 
-MAX_CONCURRENT = 4          # parallel browser contexts
+MAX_CONCURRENT = 4          # parallel threads
 PAGE_TIMEOUT   = 15_000     # ms per page load
-MAX_PAGES_PER_SITE = 3      # homepage + up to 2 sub-pages (/contact, /about)
+MAX_PAGES_PER_SITE = 3      # homepage + up to 2 sub-pages
 
 _CONTACT_SLUGS = [
     "/contact", "/contact-us", "/contactus", "/get-in-touch",
@@ -22,11 +22,10 @@ _CONTACT_SLUGS = [
 ]
 
 
-async def enrich_lead(website_url: str) -> dict:
-    """
-    Visit a business website and extract emails + social links.
-    Returns enrichment dict: {emails, social_links, linkedin_url, ...}
-    """
+# ── Sync enrichment (runs inside a thread) ───────────────────────────────────
+
+def _sync_enrich_lead(website_url: str) -> dict:
+    """Visit a website and extract emails + social links (sync Playwright)."""
     if not website_url:
         return _empty_enrichment()
 
@@ -34,18 +33,20 @@ async def enrich_lead(website_url: str) -> dict:
     emails: List[str] = []
     social_links: dict = {}
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        ctx_opts = await get_stealth_context_options()
-        context = await browser.new_context(**ctx_opts)
-        page = await context.new_page()
-        await apply_stealth_scripts(page)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
 
-        # Block heavy media to speed things up
-        await page.route(
+        # Block heavy media
+        page.route(
             "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,mp3,woff,woff2,ttf}",
             lambda r: r.abort()
         )
@@ -61,14 +62,13 @@ async def enrich_lead(website_url: str) -> dict:
             visited.add(current_url)
 
             try:
-                await page.goto(current_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-                await asyncio.sleep(1.5)
+                page.goto(current_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                time.sleep(1.5)
 
-                html = await page.content()
+                html = page.content()
                 page_emails = extract_emails(html)
                 page_socials = extract_social_links(html)
 
-                # Merge results
                 for e in page_emails:
                     if e not in emails:
                         emails.append(e)
@@ -78,7 +78,7 @@ async def enrich_lead(website_url: str) -> dict:
 
                 pages_visited += 1
 
-                # Queue contact/about pages from the homepage only
+                # Queue contact/about pages from homepage only
                 if pages_visited == 1:
                     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
                     for slug in _CONTACT_SLUGS:
@@ -93,17 +93,24 @@ async def enrich_lead(website_url: str) -> dict:
             except Exception as e:
                 logger.warning(f"Error visiting {current_url}: {e}")
 
-        await context.close()
-        await browser.close()
+        context.close()
+        browser.close()
 
     return {
-        "emails": emails[:10],   # cap at 10
+        "emails": emails[:10],
         "social_links": social_links,
         "linkedin_url": social_links.get("linkedin"),
         "instagram_url": social_links.get("instagram"),
         "facebook_url": social_links.get("facebook"),
         "twitter_url": social_links.get("twitter"),
     }
+
+
+# ── Async wrappers ──────────────────────────────────────────────────────────
+
+async def enrich_lead(website_url: str) -> dict:
+    """Async wrapper — runs sync enrichment in a thread."""
+    return await asyncio.to_thread(_sync_enrich_lead, website_url)
 
 
 async def enrich_leads_batch(
@@ -113,7 +120,6 @@ async def enrich_leads_batch(
     """
     Enrich a batch of leads concurrently (up to MAX_CONCURRENT at once).
     Each lead dict must have 'id' and 'website_url'.
-    Returns list of {lead_id, enrichment} dicts.
     """
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     results = []

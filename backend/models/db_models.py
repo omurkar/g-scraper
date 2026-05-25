@@ -20,9 +20,12 @@ class SearchJob(Base):
     __tablename__ = "search_jobs"
 
     id = Column(String, primary_key=True, default=_uuid)
-    keyword = Column(String, nullable=False)
-    location = Column(String, nullable=False)
-    status = Column(String, default="pending")      # pending|scraping|enriching|verifying|completed|failed
+    keyword = Column(String, nullable=False)          # comma-separated if multiple
+    location = Column(String, nullable=False)          # city name
+    localities = Column(JSON, default=list)            # selected locality names
+    categories = Column(JSON, default=list)            # selected GMB categories
+    lead_goal = Column(Integer, default=30)            # target number of leads
+    status = Column(String, default="pending")         # pending|scraping|health_check|enriching|verifying|completed|failed
     total_results = Column(Integer, default=0)
     processed_results = Column(Integer, default=0)
     error_message = Column(Text, nullable=True)
@@ -45,7 +48,15 @@ class Lead(Base):
     website_url = Column(String, nullable=True)
     google_maps_url = Column(String, nullable=True)
     category = Column(String, nullable=True)
-    status = Column(String, default="scraped")      # scraped|enriching|enriched|verified
+    locality = Column(String, nullable=True)              # which locality this lead came from
+    status = Column(String, default="scraped")            # scraped|health_checked|enriching|enriched|verified
+    # ── Health Audit ──────────────────────────────────────────
+    website_tag = Column(String, nullable=True)           # NO_SITE | FIX_NEEDED | GOOD_SITE
+    ssl_ok = Column(Boolean, nullable=True)
+    load_time_ms = Column(Integer, nullable=True)
+    mobile_friendly = Column(Boolean, nullable=True)
+    http_status = Column(Integer, nullable=True)
+    health_issues = Column(JSON, default=list)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     search_job = relationship("SearchJob", back_populates="leads")
